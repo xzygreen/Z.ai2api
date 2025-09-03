@@ -1,186 +1,194 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """
 Z.ai 2 API
-将 Z.ai 代理为 OpenAI Compatible 格式，支持免 Cookie、智能处理思考链等功能
+将 Z.ai 代理为 OpenAI Compatible 格式，支持免令牌、智能处理思考链、图片上传（仅登录后）等功能
 基于 https://github.com/kbykb/OpenAI-Compatible-API-Proxy-for-Z 使用 AI 辅助重构。
 """
 
-import json, re, requests, logging
+import os, json, re, requests, logging, uuid, base64
 from datetime import datetime
 from flask import Flask, request, Response, jsonify, make_response
+from dotenv import load_dotenv
+load_dotenv()
 
 # --- 配置 ---
-API_BASE = "https://chat.z.ai"
-PORT = 8080 # 对外端口
-UPSTREAM_TOKEN = "eyJhbGciOiJFUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6IjMxNmJjYjQ4LWZmMmYtNGExNS04NTNkLWYyYTI5YjY3ZmYwZiIsImVtYWlsIjoiR3Vlc3QtMTc1NTg0ODU4ODc4OEBndWVzdC5jb20ifQ.PktllDySS3trlyuFpTeIZf-7hl8Qu1qYF3BxjgIul0BrNux2nX9hVzIjthLXKMWAf9V0qM8Vm_iyDqkjPGsaiQ"
-MODEL_NAME = "GLM-4.5" # 没传入模型时选用的默认模型
-DEBUG_MODE = True # 显示调试信息
-THINK_TAGS_MODE = "think" # 思考链处理，选项说明详见 https://github.com/hmjz100/Z.ai2api/blob/main/README.md#%E5%8A%9F%E8%83%BD
-ANON_TOKEN_ENABLED = True # 是否启用访客模式（即不调用 UPSTREAM_TOKEN）
+BASE = str(os.getenv("BASE", "https://chat.z.ai"))
+PORT = int(os.getenv("PORT", "8080"))
+MODEL = str(os.getenv("MODEL", "GLM-4.5"))
+TOKEN = str(os.getenv("TOKEN", "")).strip()
+DEBUG_MODE = str(os.getenv("DEBUG", "false")).lower() == "true"
+THINK_TAGS_MODE = str(os.getenv("THINK_TAGS_MODE", "reasoning"))
+ANONYMOUS_MODE = str(os.getenv("ANONYMOUS_MODE", "true")).lower() == "true"
 
 BROWSER_HEADERS = {
-	"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/139.0.0.0",
+	"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36",
 	"Accept": "*/*",
 	"Accept-Language": "zh-CN,zh;q=0.9",
 	"X-FE-Version": "prod-fe-1.0.76",
 	"sec-ch-ua": '"Not;A=Brand";v="99", "Edge";v="139"',
 	"sec-ch-ua-mobile": "?0",
 	"sec-ch-ua-platform": '"Windows"',
-	"Origin": API_BASE,
+	"Origin": BASE,
 }
 
 # --- 日志 ---
 logging.basicConfig(level=logging.DEBUG if DEBUG_MODE else logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 log = logging.getLogger(__name__)
 
-def debug(msg, *args): 
+def debug(msg, *args):
 	if DEBUG_MODE: log.debug(msg, *args)
 
 # --- Flask 应用 ---
 app = Flask(__name__)
 
+phaseBak = "thinking"
 # --- 工具函数 ---
-def set_cors(resp):
-	resp.headers.update({
-		"Access-Control-Allow-Origin": "*",
-		"Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-		"Access-Control-Allow-Headers": "Content-Type, Authorization",
-	})
-	return resp
+class utils:
+	@staticmethod
+	class request:
+		@staticmethod
+		def chat(data, chat_id):
+			# debug("收到请求: %s", json.dumps(data))
+			return requests.post(f"{BASE}/api/chat/completions", json=data, headers={**BROWSER_HEADERS, "Authorization": f"Bearer {utils.request.token()}", "Referer": f"{BASE}/c/{chat_id}"}, stream=True, timeout=60)
+		@staticmethod
+		def image(data_url, chat_id):
+			try:
+				if ANONYMOUS_MODE or not data_url.startswith("data:"):
+					return None
 
-def new_id(prefix="msg"): return f"{prefix}-{int(datetime.now().timestamp()*1e9)}"
+				header, encoded = data_url.split(",", 1)
+				mime_type = header.split(";")[0].split(":")[1] if ":" in header else "image/jpeg"
 
-history_phase = "thinking"
-def process_content(content: str, phase: str) -> str:
-	global history_phase
-	history_content = content
-	if content and (phase == "thinking" or "summary>" in content):
-		content = re.sub(r"(?s)<details[^>]*?>.*?</details>", "", content)
-		content = content.replace("</thinking>", "").replace("<Full>", "").replace("</Full>", "")
-		if THINK_TAGS_MODE == "think":
-			if phase == "thinking":
-				content = content.lstrip("> ").replace("\n>", "\n").strip()
+				image_data = base64.b64decode(encoded) # 解码数据
+				filename = str(uuid.uuid4())
 
-			content = re.sub(r'\n?<summary>.*?</summary>\n?', '', content)
-			content = re.sub(r"<details[^>]*>\n?", "<think>\n\n", content)
-			content = re.sub(r"\n?</details>", "\n\n</think>", content)
-			if phase == "answer":
-				# 判断 </think> 后是否有内容
-				match = re.search(r"(?s)^(.*?</think>)(.*)$", content)
-				if match:
-					before, after = match.groups()
-					if after.strip():
-						# 回答休止：</think> 后有内容
-						if history_phase == "thinking":
-							# 上条是思考 → 结束思考，加上回答
-							content = f"\n\n</think>\n\n{after.lstrip('\n')}"
-						elif history_phase == "answer":
-							# 上条是回答 → 清除所有
-							content = ""
-					else:
-						# 思考休止：</think> 后没有内容 → 保留一个 </think>
-						content = "\n\n</think>"
-		elif THINK_TAGS_MODE == "pure":
-			if phase == "thinking":
-				content = re.sub(r'\n?<summary>.*?</summary>', '', content)
+				debug("上传文件：%s", filename)
+				response = requests.post(f"{BASE}/api/v1/files/", files={"file": (filename, image_data, mime_type)}, headers={**BROWSER_HEADERS, "Authorization": f"Bearer {utils.request.token()}", "Referer": f"{BASE}/c/{chat_id}"}, timeout=30)
 
-			content = re.sub(r"<details[^>]*>\n?", "<details type=\"reasoning\">", content)
-			content = re.sub(r"\n?</details>", "\n\n></details>", content)
+				if response.status_code == 200:
+					result = response.json()
+					return f"{result.get("id")}_{result.get("filename")}"
+				else:
+					raise Exception(response.text)
+			except Exception as e:
+				debug("图片上传失败: %s", e)
+			return None
+		@staticmethod
+		def id(prefix = "msg") -> str:
+			return f"{prefix}-{int(datetime.now().timestamp()*1e9)}"
+		@staticmethod
+		def token() -> str:
+			if not ANONYMOUS_MODE: return TOKEN
+			try:
+				r = requests.get(f"{BASE}/api/v1/auths/", headers=BROWSER_HEADERS, timeout=8)
+				token = r.json().get("token")
+				if token:
+					debug("获取匿名令牌: %s...", token[:15])
+					return token
+			except Exception as e:
+				debug("匿名令牌获取失败: %s", e)
+			return TOKEN
+		@staticmethod
+		def response(resp):
+			resp.headers.update({
+				"Access-Control-Allow-Origin": "*",
+				"Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+				"Access-Control-Allow-Headers": "Content-Type, Authorization",
+			})
+			return resp
+	@staticmethod
+	class response:
+		@staticmethod
+		def parse(stream):
+			for line in stream.iter_lines():
+				if not line or not line.startswith(b"data: "): continue
+				try: data = json.loads(line[6:].decode("utf-8", "ignore"))
+				except: continue
+				yield data
+		@staticmethod
+		def format(data) -> dict:
+			data = data.get("data", "")
+			if not data: return {"content": ""}
+			phase = data.get("phase", "other")
+			content = data.get("delta_content") or data.get("edit_content") or ""
+			if not content: return {"content": ""}
+			contentBak = content
+			global phaseBak
+			if phase == "thinking" or (phase == "answer" and "summary>" in content):
+				content = re.sub(r"(?s)<details[^>]*?>.*?</details>", "", content)
+				content = content.replace("</thinking>", "").replace("<Full>", "").replace("</Full>", "")
 
-			if phase == "answer":
-				# 判断 </details> 后是否有内容
-				match = re.search(r"(?s)^(.*?</details>)(.*)$", content)
-				if match:
-					before, after = match.groups()
-					if after.strip():
-						# 回答休止：</think> 后有内容
-						if history_phase == "thinking":
-							# 上条是思考 → 结束思考, 去除回答开头空格，加上回答
-							content = f"\n\n{after.lstrip('\n')}"
-						elif history_phase == "answer":
-							# 上条是回答 → 清除所有
-							content = ""
-					else:
-						content = ""
-			content = re.sub(r"</?details[^>]*>", "", content)
-		elif THINK_TAGS_MODE == "raw":
-			if phase == "thinking":
-				content = re.sub(r'\n?<summary>.*?</summary>', '', content)
+				if phase == "thinking":
+					content = re.sub(r'\n*<summary>.*?</summary>\n*', '\n\n', content)
 
-			content = re.sub(r"<details[^>]*>\n?", "<details type=\"reasoning\" open><div>\n\n", content)
-			content = re.sub(r"\n?</details>", "\n\n</div></details>", content)
+				content = re.sub(r"<details[^>]*>\n*", "<reasoning>\n\n", content)
+				content = re.sub(r"\n*</details>", "\n\n</reasoning>", content)
 
-			if phase == "answer":
-				# 判断 </details> 后是否有内容
-				match = re.search(r"(?s)^(.*?</details>)(.*)$", content)
-				if match:
-					before, after = match.groups()
-					if after.strip():
-						# 回答休止：</think> 后有内容
-						if history_phase == "thinking":
-							# 上条是思考 → 结束思考，加上回答
-							content = f"\n\n</details>\n\n{after.lstrip('\n')}"
-						elif history_phase == "answer":
-							# 上条是回答 → 清除所有
-							content = ""
-					else:
-						# 思考休止: </details> 后没有内容 → 加入 summary + </details>
+				if phase == "answer":
+					match = re.search(r"(?s)^(.*?</reasoning>)(.*)$", content) # 判断 </reasoning> 后是否有内容
+					if match:
+						before, after = match.groups()
+						if after.strip():
+							# </reasoning> 后有内容
+							if phaseBak == "thinking":
+								# 思考休止 → 结束思考，加上回答
+								content = f"\n\n</reasoning>\n\n{after.lstrip('\n')}"
+							elif phaseBak == "answer":
+								# 回答休止 → 清除所有
+								content = ""
+						else:
+							# 思考休止 → </reasoning> 后无内容
+							content = "\n\n</reasoning>"
+
+				if THINK_TAGS_MODE == "reasoning":
+					if phase == "thinking": content = re.sub(r'\n>\s?', '\n', content)
+					content = re.sub(r'\n*<summary>.*?</summary>\n*', '', content)
+					content = re.sub(r"<reasoning>\n*", "", content)
+					content = re.sub(r"\n*</reasoning>", "", content)
+				elif THINK_TAGS_MODE == "think":
+					if phase == "thinking": content = re.sub(r'\n>\s?', '\n', content)
+					content = re.sub(r'\n*<summary>.*?</summary>\n*', '', content)
+					content = re.sub(r"<reasoning>", "<think>", content)
+					content = re.sub(r"</reasoning>", "</think>", content)
+				elif THINK_TAGS_MODE == "strip":
+					content = re.sub(r'\n*<summary>.*?</summary>\n*', '', content)
+					content = re.sub(r"<reasoning>\n*", "", content)
+					content = re.sub(r"</reasoning>", "", content)
+				elif THINK_TAGS_MODE == "details":
+					if phase == "thinking": content = re.sub(r'\n>\s?', '\n', content)
+					content = re.sub(r"<reasoning>", "<details type=\"reasoning\" open><div>", content)
+					thoughts = ""
+					if phase == "answer":
+						# 判断是否有 <summary> 内容
 						summary_match = re.search(r"(?s)<summary>.*?</summary>", before)
 						duration_match = re.search(r'duration="(\d+)"', before)
-
 						if summary_match:
-							content = f"\n\n</div>{summary_match.group()}</details>\n\n"
+							# 有内容 → 直接照搬
+							thoughts = f"\n\n{summary_match.group()}"
+						# 判断是否有 duration 内容
 						elif duration_match:
-							duration = duration_match.group(1)
-							content = f'\n\n</div><summary>Thought for {duration} seconds</summary></details>\n\n'
-						else:
-							content = "\n\n</div></details>"
+							# 有内容 → 通过 duration 生成 <summary>
+							thoughts = f'\n\n<summary>Thought for {duration_match.group(1)} seconds</summary>'
+					content = re.sub(r"</reasoning>", f"</div>{thoughts}</details>", content)
+				else:
+					content = re.sub(r"</reasoning>", "</reasoning>\n\n", content)
+					debug("警告：THINK_TAGS_MODE 传入了未知的替换模式，将使用 <reasoning> 标签。")
 
-	if repr(content) != repr(history_content):
-		debug("R 内容: %s %s", phase, repr(history_content))
-		debug("W 内容: %s %s", phase, repr(content))
-	else:
-		debug("R 内容: %s %s", phase, repr(history_content))
-	history_phase = phase
-	return content
-	
+			phaseBak = phase
+			if repr(content) != repr(contentBak):
+				debug("R 内容: %s %s", phase, repr(contentBak))
+				debug("W 内容: %s %s", phase, repr(content))
+			else:
+				debug("R 内容: %s %s", phase, repr(contentBak))
 
-def get_token() -> str:
-	if not ANON_TOKEN_ENABLED: return UPSTREAM_TOKEN
-	try:
-		r = requests.get(f"{API_BASE}/api/v1/auths/", headers=BROWSER_HEADERS, timeout=8)
-		token = r.json().get("token")
-		if token: 
-			debug("获取匿名 token: %s...", token[:10])
-			return token
-	except Exception as e:
-		debug("匿名 token 获取失败: %s", e)
-	return UPSTREAM_TOKEN
-
-def call_upstream(data, chat_id):
-	headers = {**BROWSER_HEADERS, "Authorization": f"Bearer {get_token()}", "Referer": f"{API_BASE}/c/{chat_id}"}
-	debug("上游请求: %s", json.dumps(data, ensure_ascii=False))
-	return requests.post(f"{API_BASE}/api/chat/completions", json=data, headers=headers, stream=True, timeout=60)
-
-def parse_upstream(upstream):
-	"""统一 SSE 解析生成器"""
-	for line in upstream.iter_lines():
-		if not line or not line.startswith(b"data: "): continue
-		try: data = json.loads(line[6:].decode("utf-8", "ignore"))
-		except: continue
-		yield data
-
-def extract_content(data):
-	phase, delta, edit = data.get("data", {}).get("phase"), data.get("data", {}).get("delta_content",""), data.get("data",{}).get("edit_content","")
-	content = delta or edit
-	if content and (phase == "answer" or phase == "thinking"):
-		return process_content(content, phase) or ""
-	return content or ""
-
+			if phase == "thinking" and THINK_TAGS_MODE == "reasoning":
+				return {"reasoning_content": content}
+			else:
+				return {"content": content}
 # --- 路由 ---
 @app.route("/v1/models", methods=["GET", "OPTIONS"])
 def models():
-	if request.method=="OPTIONS": return set_cors(make_response())
+	if request.method == "OPTIONS": return utils.request.response(make_response())
 	try:
 		def format_model_name(name: str) -> str:
 			"""格式化模型名:
@@ -203,19 +211,18 @@ def models():
 				else:
 					formatted.append(p)
 			return "-".join(formatted)
-		
+
 		def is_english_letter(ch: str) -> bool:
 			"""判断是否是英文字符 (A-Z / a-z)"""
 			return 'A' <= ch <= 'Z' or 'a' <= ch <= 'z'
 
-		headers = {**BROWSER_HEADERS, "Authorization": f"Bearer {get_token()}"}
-		r = requests.get(f"{API_BASE}/api/models", headers=headers, timeout=8).json()
+		headers = {**BROWSER_HEADERS, "Authorization": f"Bearer {utils.request.token()}"}
+		r = requests.get(f"{BASE}/api/models", headers=headers, timeout=8).json()
 		models = []
 		for m in r.get("data", []):
 			if not m.get("info", {}).get("is_active", True):
 				continue
 			model_id, model_name = m.get("id"), m.get("name")
-			# 使用规则格式化
 			if model_id.startswith(("GLM", "Z")):
 				model_name = model_id
 			if not model_name or not is_english_letter(model_name[0]):
@@ -227,44 +234,103 @@ def models():
 				"created": m.get("info", {}).get("created_at", int(datetime.now().timestamp())),
 				"owned_by": "z.ai"
 			})
-		return set_cors(jsonify({"object":"list","data":models}))
+		return utils.request.response(jsonify({"object":"list","data":models}))
 	except Exception as e:
 		debug("模型列表失败: %s", e)
-		return set_cors(jsonify({"error":"fetch models failed"})), 500
+		return utils.request.response(jsonify({"error":"fetch models failed"})), 500
 
 @app.route("/v1/chat/completions", methods=["POST", "OPTIONS"])
-def chat():
-	if request.method=="OPTIONS": return set_cors(make_response())
-	req = request.get_json(force=True, silent=True) or {}
-	chat_id, msg_id, model = new_id("chat"), new_id("msg"), req.get("model", MODEL_NAME)
-	upstream_data = {
-		"stream": req.get("stream", False),
-		"chat_id": chat_id, "id": msg_id,
+def OpenAI_Compatible():
+	if request.method == "OPTIONS": return utils.request.response(make_response())
+	odata = request.get_json(force=True, silent=True) or {}
+
+	id = utils.request.id("chat")
+	model = odata.get("model", MODEL)
+	messages = odata.get("messages", [])
+	features = odata.get("features", { "enable_thinking": True })
+	stream = odata.get("stream", False)
+
+	for message in messages:
+		if isinstance(message.get("content"), list):
+			for content_item in message["content"]:
+				if content_item.get("type") == "image_url":
+					url = content_item.get("image_url", {}).get("url", "")
+					if url.startswith("data:"):
+						file_url = utils.request.image(url, id) # 上传图片
+						if file_url:
+							content_item["image_url"]["url"] = file_url # 上传后的图片链接
+
+	data = {
+		"stream": True,
+		"chat_id": id,
+		"id": utils.request.id(),
 		"model": model,
-		"messages": req.get("messages", []),
-		"features": {"enable_thinking": True},
+		"messages": messages,
+		"features": features
 	}
+
 	try:
-		upstream = call_upstream(upstream_data, chat_id)
+		response = utils.request.chat(data, id)
 	except Exception as e:
-		return set_cors(make_response(f"上游调用失败: {e}", 502))
-	
-	if req.get("stream", False):
+		return utils.request.response(make_response(f"上游请求失败: {e}", 502))
+
+	if stream:
 		def stream():
-			yield f"data: {json.dumps({'id':new_id('chatcmpl'),'object':'chat.completion.chunk','model':model,'choices':[{'index':0,'delta':{'role':'assistant'}}]},ensure_ascii=False)}\n\n"
-			for data in parse_upstream(upstream):
-				if data.get("data",{}).get("done"): break
-				content = extract_content(data)
-				if content: yield f"data: {json.dumps({'id':new_id('chatcmpl'),'object':'chat.completion.chunk','model':model,'choices':[{'index':0,'delta':{'content':content}}]},ensure_ascii=False)}\n\n"
+			yield f"data: {json.dumps({'id':utils.request.id('chatcmpl'),'object':'chat.completion.chunk','model':model,'choices':[{'index':0,'delta':{'role':'assistant'}}]})}\n\n"
+			for data in utils.response.parse(response):
+				if data.get("data",{}).get("done"):
+					break
+				delta = utils.response.format(data)
+				if delta:
+					yield f"data: {json.dumps({'id':utils.request.id('chatcmpl'),'object':'chat.completion.chunk','model':model,'choices':[{'index':0,'delta':delta}]})}\n\n"
 			yield "data: [DONE]\n\n"
-		return Response(stream(), mimetype="text/event-stream")
+		return Response(stream(), mimetype = "text/event-stream")
 	else:
-		content = "".join(extract_content(d) for d in parse_upstream(upstream))
-		resp = {"id":new_id("chatcmpl"),"object":"chat.completion","model":model,"choices":[{"index":0,"message":{"role":"assistant","content":content},"finish_reason":"stop"}],"usage":{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0}}
-		return set_cors(jsonify(resp))
+		# 上游不支持非流式，所以先用流式获取所有内容
+		contents = {
+			"content": [],
+			"reasoning_content": []
+		}
+		for odata in utils.response.parse(response):
+			if odata.get("data", {}).get("done"):
+				break
+			delta = utils.response.format(odata)
+			if delta:
+				if "content" in delta:
+					contents["content"].append(delta["content"])
+				if "reasoning_content" in delta:
+					contents["reasoning_content"].append(delta["reasoning_content"])
+
+		# 构建最终消息内容
+		final_message = {"role": "assistant"}
+		if contents["reasoning_content"]:
+			final_message["reasoning_content"] = "".join(contents["reasoning_content"])
+		if contents["content"]:
+			final_message["content"] = "".join(contents["content"])
+
+		resp = {
+			"id": utils.request.id("chatcmpl"),
+			"object": "chat.completion",
+			"model": model,
+			"choices": [{
+				"index": 0,
+				"message": final_message,
+				"finish_reason": "stop"
+			}]
+		}
+		return utils.request.response(jsonify(resp))
 
 # --- 主入口 ---
 if __name__ == "__main__":
-	log.info("代理启动: 端口=%s, 备选模型=%s，思考处理=%s, Debug=%s", PORT, MODEL_NAME, THINK_TAGS_MODE, DEBUG_MODE)
-	app.run(host="0.0.0.0", port=PORT, threaded=True)
+	log.info("---------------------------------------------------------------------")
+	log.info("Z.ai 2 API")
+	log.info("将 Z.ai 代理为 OpenAI Compatible 格式")
+	log.info("基于 https://github.com/kbykb/OpenAI-Compatible-API-Proxy-for-Z 重构")
+	log.info("---------------------------------------------------------------------")
+	log.info("服务端口：%s", PORT)
+	log.info("备选模型：%s", MODEL)
+	log.info("思考处理：%s", THINK_TAGS_MODE)
+	log.info("访客模式：%s", ANONYMOUS_MODE)
+	log.info("显示调试：%s", DEBUG_MODE)
 	# app.run(host="0.0.0.0", port=PORT, threaded=True, debug=True)
+	app.run(host="0.0.0.0", port=PORT, threaded=True)
